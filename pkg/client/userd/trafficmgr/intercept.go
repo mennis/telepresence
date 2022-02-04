@@ -469,7 +469,6 @@ func (tm *TrafficManager) AddIntercept(c context.Context, ir *rpc.CreateIntercep
 		}
 		result.InterceptInfo = wr.intercept
 		if ir.MountPoint != "" && ii.SftpPort > 0 {
-			result.Environment["TELEPRESENCE_ROOT"] = ir.MountPoint
 			deleteMount = false // Mount-point is busy until intercept ends
 			ii.Spec.MountPoint = ir.MountPoint
 		}
@@ -629,10 +628,11 @@ func (tm *TrafficManager) reconcileAPIServers(ctx context.Context) {
 	wantedMatchers := make(map[string]*manager.InterceptInfo)
 	agents := tm.getCurrentAgents()
 
-	agentAPIPort := func(is *manager.InterceptSpec) int {
+	agentAPIPort := func(ii *manager.InterceptInfo) int {
+		is := ii.Spec
 		for _, a := range agents {
 			if a.Name == is.Agent && a.Namespace == is.Namespace {
-				if ps, ok := a.Environment["TELEPRESENCE_API_PORT"]; ok {
+				if ps, ok := ii.Environment["TELEPRESENCE_API_PORT"]; ok {
 					port, err := strconv.ParseUint(ps, 10, 16)
 					if err == nil {
 						return int(port)
@@ -648,7 +648,7 @@ func (tm *TrafficManager) reconcileAPIServers(ctx context.Context) {
 
 	for _, ic := range tm.currentIntercepts {
 		if ic.Disposition == manager.InterceptDispositionType_ACTIVE {
-			if port := agentAPIPort(ic.Spec); port > 0 {
+			if port := agentAPIPort(ic); port > 0 {
 				wantedPorts[port] = struct{}{}
 				wantedMatchers[ic.Id] = ic
 			}
