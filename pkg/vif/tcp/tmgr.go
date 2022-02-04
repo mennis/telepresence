@@ -44,11 +44,11 @@ func (h *handler) sendToMgr(ctx context.Context, pkt Packet) bool {
 
 func (h *handler) adjustReceiveWindow() {
 	// Adjust window size based on current queue sizes.
-	queueFactor := 2*ioChannelSize - (len(h.toMgrCh) + len(h.fromTun))
+	queueFactor := (2*ioChannelSize - (len(h.toMgrCh) + len(h.fromTun))) / 2
 	windowSize := 0
 	if queueFactor > 0 {
 		// Make window size dependent on the number o element on the queue
-		windowSize = queueFactor * (maxReceiveWindow / (2 * ioChannelSize))
+		windowSize = queueFactor * (maxReceiveWindow / ioChannelSize)
 
 		// Strip the last 8 bits so that we don't change so often
 		windowSize &^= 0xff

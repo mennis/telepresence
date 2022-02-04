@@ -249,6 +249,11 @@ func (h *handler) Reset(ctx context.Context, initialPacket ip.Packet) error {
 	return h.toTun.Write(ctx, initialPacket.(Packet).Reset())
 }
 
+// Discard returns true if the package should be discarded
+func (h *handler) Discard(initialPacket ip.Packet) bool {
+	return initialPacket.(Packet).Header().SYN()
+}
+
 func (h *handler) Start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	go h.processResends(ctx)
