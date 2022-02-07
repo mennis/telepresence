@@ -22,7 +22,7 @@ var podResource = meta.GroupVersionResource{Version: "v1", Group: "", Resource: 
 var findMatchingService = install.FindMatchingService
 
 type agentInjector struct {
-	agentConfigs map[string]Map
+	agentConfigs Map
 }
 
 type agentConfig struct {
@@ -392,15 +392,13 @@ func hidePorts(pod *core.Pod, cn *core.Container, portName string, patches []pat
 }
 
 func (a *agentInjector) findConfigMapValue(ctx context.Context, obj k8sapi.Object) (*agentConfig, error) {
-	if v, ok := a.agentConfigs[obj.GetNamespace()]; ok {
-		ag := agentConfig{}
-		ok, err := v.GetInto(obj.GetName(), &ag)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return &ag, nil
-		}
+	ag := agentConfig{}
+	ok, err := a.agentConfigs.GetInto(obj.GetName(), obj.GetNamespace(), &ag)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return &ag, nil
 	}
 	refs := obj.GetOwnerReferences()
 	for i := range refs {

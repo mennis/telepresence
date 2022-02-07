@@ -12,10 +12,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/datawire/dlib/dtime"
-
-	"github.com/datawire/dlib/dgroup"
-
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 
 	admission "k8s.io/api/admission/v1"
@@ -24,8 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 
+	"github.com/datawire/dlib/dgroup"
 	"github.com/datawire/dlib/dhttp"
 	"github.com/datawire/dlib/dlog"
+	"github.com/datawire/dlib/dtime"
 	"github.com/telepresenceio/telepresence/v2/pkg/install"
 )
 
@@ -87,27 +85,25 @@ func ServeMutator(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	env := managerutil.GetEnv(ctx)
+	cw, err := loadAgentConfigs(ctx, env.ManagerNamespace)
+	if err != nil {
+		return err
+	}
+	ai = &agentInjector{agentConfigs: cw}
 	dgroup.ParentGroup(ctx).Go("agent-configs", func(ctx context.Context) error {
-		dtime.SleepWithContext(ctx, 2*time.Second) // Give the server some time to start
-		env := managerutil.GetEnv(ctx)
-		acs, err := loadAgentConfigs(ctx, env.ManagerNamespace)
-		if err != nil {
-			return err
-		}
-		ai = &agentInjector{agentConfigs: acs}
-		return nil
+		dtime.SleepWithContext(ctx, time.Second) // Give the server some time to start
+		return cw.Run(ctx)
 	})
 
 	server := &dhttp.ServerConfig{Handler: mux}
 	addr := ":" + strconv.Itoa(install.MutatorWebhookPortHTTPS)
-	dlog.Infof(ctx, "Mutating webhook service is listening on %v", addr)
-	err := server.ListenAndServeTLS(ctx, addr, certPath, keyPath)
-	if err != nil {
-		err = fmt.Errorf("mutating webhook service stopped. %w", err)
-		return err
-	}
-	dlog.Info(ctx, "Mutating webhook service stopped")
 
+	dlog.Infof(ctx, "Mutating webhook service is listening on %v", addr)
+	defer dlog.Info(ctx, "Mutating webhook service stopped")
+	if err = server.ListenAndServeTLS(ctx, addr, certPath, keyPath); err != nil {
+		return fmt.Errorf("mutating webhook service stopped. %w", err)
+	}
 	return nil
 }
 
