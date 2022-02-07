@@ -227,8 +227,8 @@ func (ki *installer) getSvcForInjectedPod(
 
 	// Find pod from svc.
 	// On fail, assume agent not present and roll (only if injected via webhook; rolling a manually managed deployment will do no good)
-	pod, err := ki.FindPodFromSelector(c, namespace, svc.Spec.Selector)
-	if err != nil {
+	pods, err := k8sapi.Pods(c, namespace, svc.Spec.Selector)
+	if err != nil || len(pods) == 0 {
 		if webhookInjected {
 			dlog.Warnf(c, "Error finding pod for %s, rolling and proceeding anyway: %v", name, err)
 			err = ki.rolloutRestart(c, obj)
@@ -241,13 +241,16 @@ func (ki *installer) getSvcForInjectedPod(
 		}
 	}
 
-	// Check pod for agent. If missing and webhookInjected, roll pod
+	// Check pods for agent. If missing and webhookInjected, roll pod
 	roll := true
-	podImpl, _ := k8sapi.PodImpl(pod)
-	for _, containter := range podImpl.Spec.Containers {
-		if containter.Name == install.AgentContainerName {
-			roll = false
-			break
+nextPod:
+	for _, pod := range pods {
+		podImpl, _ := k8sapi.PodImpl(pod)
+		for _, containter := range podImpl.Spec.Containers {
+			if containter.Name == install.AgentContainerName {
+				roll = false
+				break nextPod
+			}
 		}
 	}
 	if roll {
@@ -420,7 +423,7 @@ func (ki *installer) waitForApply(c context.Context, name, namespace string, obj
 // We need this because updating a Replica Set does *not* generate new
 // pods if the desired amount already exists.
 func (ki *installer) refreshReplicaSet(c context.Context, namespace string, rs *apps.ReplicaSet) error {
-	pods, err := k8sapi.Pods(c, namespace)
+	pods, err := k8sapi.Pods(c, namespace, rs.Spec.Selector.MatchLabels)
 	if err != nil {
 		return err
 	}
