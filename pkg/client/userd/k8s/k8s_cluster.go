@@ -28,7 +28,7 @@ type Cluster struct {
 	// Current Namespace snapshot, get set by namespace Watcher.
 	// The boolean value indicates if this client is allowed to
 	// watch services and retrieve workloads in the namespace
-	nsWatcher *Watcher
+	nsWatcher *k8sapi.Watcher
 
 	// nsLock protects currentMappedNamespaces and namespaceListener
 	nsLock sync.Mutex
