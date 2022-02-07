@@ -61,7 +61,7 @@ service:
 # The log level of the Traffic Manager.
 #
 # Default: info
-logLevel: info
+logLevel: debug
 
 # GRPC configuration for the Traffic Manager.
 # This is identical to the grpc configuration for local clients.

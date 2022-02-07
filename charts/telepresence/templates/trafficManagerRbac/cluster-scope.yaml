@@ -33,10 +33,21 @@ rules:
   - ""
   resources:
   - pods
+  - configmaps
   verbs:
   - list
   - get
   - watch
+- apiGroups:
+  - "apps"
+  resources:
+  - deployments
+  - replicasets
+  - statefulsets
+  verbs:
+  - list
+  - get
+  - patch
 # Needed for the `gather-logs` command to work on components in the kubernetes
 # cluster (traffic-manager + traffic-agents)
 - apiGroups:

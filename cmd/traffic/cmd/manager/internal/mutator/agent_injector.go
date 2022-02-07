@@ -21,20 +21,15 @@ import (
 var podResource = meta.GroupVersionResource{Version: "v1", Group: "", Resource: "pods"}
 var findMatchingService = install.FindMatchingService
 
-func agentInjector(ctx context.Context, req *admission.AdmissionRequest) ([]patchOperation, error) {
-	// This handler should only get called on Pod objects as per the MutatingWebhookConfiguration in the YAML file.
-	// Pod objects are immutable, hence we only care about the CREATE event.
-	// Applying patches to Pods instead of Deployments means we don't have side effects on
-	// user-managed Deployments and Services. It also means we don't have to manage update flows
-	// such as removing or updating the sidecar in Deployments objects... a new Pod just gets created instead!
+type agentInjector struct {
+	agentConfigs map[string]Map
+}
 
-	// If (for whatever reason) this handler is invoked on an object different than a Pod,
-	// issue a log message and let the object request pass through.
-	if req.Resource != podResource {
-		dlog.Debugf(ctx, "expect resource to be %s, got %s; skipping", podResource, req.Resource)
-		return nil, nil
-	}
+type agentConfig struct {
+	Kind string `json:"kind"`
+}
 
+func getPod(req *admission.AdmissionRequest) (*core.Pod, error) {
 	// Parse the Pod object.
 	raw := req.Object.Raw
 	pod := core.Pod{}
@@ -46,30 +41,58 @@ func agentInjector(ctx context.Context, req *admission.AdmissionRequest) ([]patc
 	if podNamespace == "" {
 		// It is very probable the pod was not yet assigned a namespace,
 		// in which case we should use the AdmissionRequest namespace.
-		podNamespace = req.Namespace
+		pod.Namespace = req.Namespace
 	}
 	podName := pod.Name
 	if podName == "" {
 		// It is very probable the pod was not yet assigned a name,
 		// in which case we should use the metadata generated name.
-		podName = pod.ObjectMeta.GenerateName
+		pod.Name = pod.ObjectMeta.GenerateName
+	}
+	return &pod, nil
+}
+
+func (a *agentInjector) inject(ctx context.Context, req *admission.AdmissionRequest) ([]patchOperation, error) {
+	// This handler should only get called on Pod objects as per the MutatingWebhookConfiguration in the YAML file.
+	// Pod objects are immutable, hence we only care about the CREATE event.
+	// Applying patches to Pods instead of Deployments means we don't have side effects on
+	// user-managed Deployments and Services. It also means we don't have to manage update flows
+	// such as removing or updating the sidecar in Deployments objects... a new Pod just gets created instead!
+
+	// If (for whatever reason) this handler is invoked on an object different from a Pod,
+	// issue a log message and let the object request pass through.
+	if req.Resource != podResource {
+		dlog.Debugf(ctx, "expect resource to be %s, got %s; skipping", podResource, req.Resource)
+		return nil, nil
+	}
+
+	pod, err := getPod(req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate traffic-agent injection preconditions.
-	refPodName := fmt.Sprintf("%s.%s", podName, podNamespace)
-	if podName == "" || podNamespace == "" {
+	refPodName := fmt.Sprintf("%s.%s", pod.Name, pod.Namespace)
+	if pod.Name == "" || pod.Namespace == "" {
 		dlog.Debugf(ctx, "Unable to extract pod name and/or namespace (got %q); skipping", refPodName)
 		return nil, nil
 	}
 
 	if pod.Annotations[install.InjectAnnotation] != "enabled" {
-		dlog.Debugf(ctx, `The %s pod has not enabled %s container injection through %q annotation; skipping`,
-			refPodName, install.AgentContainerName, install.InjectAnnotation)
-		return nil, nil
+		cfv, err := a.findConfigMapValue(ctx, k8sapi.Pod(pod))
+		if err != nil {
+			dlog.Error(ctx, err)
+			return nil, err
+		}
+		if cfv == nil {
+			dlog.Debugf(ctx, `The %s pod has not enabled %s container injection through %q configmap or %q annotation; skipping`,
+				refPodName, install.AgentContainerName, AgentsConfigMap, install.InjectAnnotation)
+			return nil, nil
+		}
 	}
 
 	svcName := pod.Annotations[install.ServiceNameAnnotation]
-	svc, err := findMatchingService(ctx, "", svcName, podNamespace, pod.Labels)
+	svc, err := findMatchingService(ctx, "", svcName, pod.Namespace, pod.Labels)
 	if err != nil {
 		dlog.Error(ctx, err)
 		return nil, err
@@ -120,21 +143,21 @@ func agentInjector(ctx context.Context, req *admission.AdmissionRequest) ([]patc
 	var patches []patchOperation
 	setGID := false
 	if servicePort.TargetPort.Type == intstr.Int || svc.Spec.ClusterIP == "None" {
-		patches = addInitContainer(ctx, &pod, servicePort, &appPort, patches)
+		patches = addInitContainer(ctx, pod, servicePort, &appPort, patches)
 		setGID = true
 	} else {
-		patches = hidePorts(&pod, appContainer, servicePort.TargetPort.StrVal, patches)
+		patches = hidePorts(pod, appContainer, servicePort.TargetPort.StrVal, patches)
 	}
 	tpEnv := make(map[string]string)
 	if env.APIPort != 0 {
 		tpEnv["TELEPRESENCE_API_PORT"] = strconv.Itoa(int(env.APIPort))
 	}
-	patches = addTPEnv(&pod, appContainer, tpEnv, patches)
-	patches, err = addAgentContainer(ctx, svc, &pod, servicePort, appContainer, &appPort, setGID, podName, podNamespace, patches)
+	patches = addTPEnv(pod, appContainer, tpEnv, patches)
+	patches, err = addAgentContainer(ctx, svc, pod, servicePort, appContainer, &appPort, setGID, pod.Name, pod.Namespace, patches)
 	if err != nil {
 		return nil, err
 	}
-	patches = addAgentVolume(&pod, patches)
+	patches = addAgentVolume(pod, patches)
 	return patches, nil
 }
 
@@ -366,4 +389,28 @@ func hidePorts(pod *core.Pod, cn *core.Container, portName string, patches []pat
 		}
 	}
 	return patches
+}
+
+func (a *agentInjector) findConfigMapValue(ctx context.Context, obj k8sapi.Object) (*agentConfig, error) {
+	if v, ok := a.agentConfigs[obj.GetNamespace()]; ok {
+		ag := agentConfig{}
+		ok, err := v.GetInto(obj.GetName(), &ag)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return &ag, nil
+		}
+	}
+	refs := obj.GetOwnerReferences()
+	for i := range refs {
+		if or := &refs[i]; or.Controller != nil && *or.Controller {
+			wl, err := k8sapi.GetWorkload(ctx, or.Name, obj.GetNamespace(), or.Kind)
+			if err != nil {
+				return nil, err
+			}
+			return a.findConfigMapValue(ctx, wl)
+		}
+	}
+	return nil, nil
 }

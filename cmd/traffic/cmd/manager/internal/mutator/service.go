@@ -10,10 +10,17 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
+
+	"github.com/datawire/dlib/dtime"
+
+	"github.com/datawire/dlib/dgroup"
+
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/managerutil"
 
 	admission "k8s.io/api/admission/v1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	core "k8s.io/api/core/v1"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 
@@ -60,10 +67,11 @@ func ServeMutator(ctx context.Context) error {
 		return nil
 	}
 
+	var ai *agentInjector
 	mux := http.NewServeMux()
 	mux.HandleFunc("/traffic-agent", func(w http.ResponseWriter, r *http.Request) {
 		dlog.Debug(ctx, "Received webhook request...")
-		bytes, statusCode, err := serveMutatingFunc(ctx, r, agentInjector)
+		bytes, statusCode, err := serveMutatingFunc(ctx, r, ai.inject)
 		if err != nil {
 			dlog.Errorf(ctx, "error handling webhook request: %v", err)
 			w.WriteHeader(statusCode)
@@ -79,6 +87,17 @@ func ServeMutator(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	dgroup.ParentGroup(ctx).Go("agent-configs", func(ctx context.Context) error {
+		dtime.SleepWithContext(ctx, 2*time.Second) // Give the server some time to start
+		env := managerutil.GetEnv(ctx)
+		acs, err := loadAgentConfigs(ctx, env.ManagerNamespace)
+		if err != nil {
+			return err
+		}
+		ai = &agentInjector{agentConfigs: acs}
+		return nil
+	})
+
 	server := &dhttp.ServerConfig{Handler: mux}
 	addr := ":" + strconv.Itoa(install.MutatorWebhookPortHTTPS)
 	dlog.Infof(ctx, "Mutating webhook service is listening on %v", addr)
@@ -88,15 +107,16 @@ func ServeMutator(ctx context.Context) error {
 		return err
 	}
 	dlog.Info(ctx, "Mutating webhook service stopped")
+
 	return nil
 }
 
 // Skip mutate requests in these namespaces
 func isNamespaceOfInterest(ctx context.Context, ns string) bool {
 	for _, skippedNs := range []string{
-		metav1.NamespacePublic,
-		metav1.NamespaceSystem,
-		corev1.NamespaceNodeLease,
+		meta.NamespacePublic,
+		meta.NamespaceSystem,
+		core.NamespaceNodeLease,
 	} {
 		if ns == skippedNs {
 			return false
@@ -139,7 +159,7 @@ func serveMutatingFunc(ctx context.Context, r *http.Request, mf mutatorFunc) ([]
 		Allowed: true,
 	}
 	admissionReviewResponse := admission.AdmissionReview{
-		TypeMeta: metav1.TypeMeta{
+		TypeMeta: meta.TypeMeta{
 			Kind:       "AdmissionReview",
 			APIVersion: "admission.k8s.io/v1",
 		},
@@ -157,7 +177,7 @@ func serveMutatingFunc(ctx context.Context, r *http.Request, mf mutatorFunc) ([]
 		// the error message into the response
 		dlog.Errorf(ctx, "mutating function error: %v", err)
 		response.Allowed = false
-		response.Result = &metav1.Status{
+		response.Result = &meta.Status{
 			Message: err.Error(),
 		}
 	} else {

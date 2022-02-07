@@ -68,4 +68,23 @@ data:
   crt.pem: {{ $genCert.Cert | b64enc }}
   key.pem: {{ $genCert.Key | b64enc }}
 {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "telepresence-agents"
+  namespace: {{ include "telepresence.namespace" . }}
+  labels:
+    {{- include "telepresence.labels" . | nindent 4 }}
+data:
+  agentInjector: |-
+{{- if .Values.managerRbac.namespaced }}
+    namespaced: true
+    namespaces:
+{{- range .Values.managerRbac.namespaces }}
+      - {{ . }}
+{{- end }}
+{{- else }}
+    namespaced: false
+{{- end }}
 {{- end }}
