@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/telepresenceio/telepresence/v2/pkg/install/agent"
+
 	"gopkg.in/yaml.v3"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,21 +60,21 @@ func loadAgentConfigs(ctx context.Context, namespace string) (m Map, err error) 
 	return newConfigWatch(AgentsConfigMap, ac.Namespaces...), nil
 }
 
-func triggerRollout(ctx context.Context, e *Entry) {
-	if e.Key == "agentInjector" {
+func triggerRollout(ctx context.Context, e *entry) {
+	if e.name == "agentInjector" {
 		return
 	}
 
-	ac := agentConfig{}
-	if err := decode(e.Value, &ac); err != nil {
-		dlog.Errorf(ctx, "Failed to decode ConfigMap entry %q into an agent config")
+	ac := agent.Config{}
+	if err := decode(e.value, &ac); err != nil {
+		dlog.Errorf(ctx, "Failed to decode ConfigMap entry %q into an agent config", e.value)
 		return
 	}
 
 	// TODO: Value will contain workload, so pass it here
-	wl, err := k8sapi.GetWorkload(ctx, e.Key, e.Namespace, ac.Kind)
+	wl, err := k8sapi.GetWorkload(ctx, e.name, e.namespace, ac.WorkloadKind)
 	if err != nil {
-		dlog.Errorf(ctx, "unable to get %s %s.%s: %v", ac.Kind, e.Key, e.Namespace, err)
+		dlog.Errorf(ctx, "unable to get %s %s.%s: %v", ac.WorkloadKind, e.name, e.namespace, err)
 		return
 	}
 	restartAnnotation := fmt.Sprintf(
@@ -81,10 +83,10 @@ func triggerRollout(ctx context.Context, e *Entry) {
 		time.Now().Format(time.RFC3339),
 	)
 	if err = wl.Patch(ctx, types.StrategicMergePatchType, []byte(restartAnnotation)); err != nil {
-		dlog.Errorf(ctx, "unable to patch %s %s.%s: %v", ac.Kind, e.Key, e.Namespace, err)
+		dlog.Errorf(ctx, "unable to patch %s %s.%s: %v", ac.WorkloadKind, e.name, e.namespace, err)
 		return
 	}
-	dlog.Infof(ctx, "Successfully rolled out %s.%s", e.Key, e.Namespace)
+	dlog.Infof(ctx, "Successfully rolled out %s.%s", e.name, e.namespace)
 }
 
 func newConfigWatch(name string, namespaces ...string) *configWatcher {
@@ -99,14 +101,14 @@ type configWatcher struct {
 	name       string
 	namespaces []string
 	data       map[string]map[string]string
-	modCh      chan Entry
-	delCh      chan Entry
+	modCh      chan entry
+	delCh      chan entry
 }
 
-type Entry struct {
-	Namespace string
-	Key       string
-	Value     string
+type entry struct {
+	name      string
+	namespace string
+	value     string
 }
 
 func (c *configWatcher) Run(ctx context.Context) error {
@@ -119,10 +121,10 @@ func (c *configWatcher) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case e := <-delCh:
-			dlog.Infof(ctx, "del %s.%s: %s", e.Key, e.Namespace, e.Value)
+			dlog.Infof(ctx, "del %s.%s: %s", e.name, e.namespace, e.value)
 			triggerRollout(ctx, &e)
 		case e := <-addCh:
-			dlog.Infof(ctx, "add %s.%s: %s", e.Key, e.Namespace, e.Value)
+			dlog.Infof(ctx, "add %s.%s: %s", e.name, e.namespace, e.value)
 			triggerRollout(ctx, &e)
 		}
 	}
@@ -146,10 +148,10 @@ func (c *configWatcher) GetInto(key, ns string, into interface{}) (bool, error) 
 	return true, nil
 }
 
-func (c *configWatcher) Start(ctx context.Context) (modCh <-chan Entry, delCh <-chan Entry, err error) {
+func (c *configWatcher) Start(ctx context.Context) (modCh <-chan entry, delCh <-chan entry, err error) {
 	c.Lock()
-	c.modCh = make(chan Entry)
-	c.delCh = make(chan Entry)
+	c.modCh = make(chan entry)
+	c.delCh = make(chan entry)
 	c.data = make(map[string]map[string]string)
 	c.Unlock()
 
@@ -214,8 +216,8 @@ func (c *configWatcher) eventHandler(ctx context.Context, evCh <-chan watch.Even
 }
 
 func (c *configWatcher) update(ctx context.Context, ns string, m map[string]string) {
-	var dels []Entry
-	var mods []Entry
+	var dels []entry
+	var mods []entry
 	c.Lock()
 	data, ok := c.data[ns]
 	if !ok {
@@ -225,19 +227,19 @@ func (c *configWatcher) update(ctx context.Context, ns string, m map[string]stri
 	for k, v := range data {
 		if _, ok := m[k]; !ok {
 			delete(data, k)
-			dels = append(dels, Entry{Namespace: ns, Key: k, Value: v})
+			dels = append(dels, entry{name: k, namespace: ns, value: v})
 		}
 	}
 	for k, v := range m {
 		if ov, ok := data[k]; ok && ov == v {
 			continue
 		}
-		mods = append(mods, Entry{Namespace: ns, Key: k, Value: v})
+		mods = append(mods, entry{name: k, namespace: ns, value: v})
 		data[k] = v
 	}
 	c.Unlock()
 
-	writeToChan := func(es []Entry, ch chan<- Entry) {
+	writeToChan := func(es []entry, ch chan<- entry) {
 		for _, e := range es {
 			select {
 			case <-ctx.Done():

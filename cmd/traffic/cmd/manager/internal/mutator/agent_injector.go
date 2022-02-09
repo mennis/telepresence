@@ -7,6 +7,14 @@ import (
 	"strconv"
 	"strings"
 
+	"gopkg.in/yaml.v3"
+
+	"k8s.io/apimachinery/pkg/labels"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+
+	"github.com/telepresenceio/telepresence/v2/pkg/install/agent"
+
 	admission "k8s.io/api/admission/v1"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,10 +31,6 @@ var findMatchingService = install.FindMatchingService
 
 type agentInjector struct {
 	agentConfigs Map
-}
-
-type agentConfig struct {
-	Kind string `json:"kind"`
 }
 
 func getPod(req *admission.AdmissionRequest) (*core.Pod, error) {
@@ -78,19 +82,58 @@ func (a *agentInjector) inject(ctx context.Context, req *admission.AdmissionRequ
 		return nil, nil
 	}
 
-	if pod.Annotations[install.InjectAnnotation] != "enabled" {
-		cfv, err := a.findConfigMapValue(ctx, k8sapi.Pod(pod))
+	hasSidecar := false
+	cns := pod.Spec.Containers
+	for i := range cns {
+		if cns[i].Name == install.AgentContainerName {
+			hasSidecar = true
+			break
+		}
+	}
+
+	var config *agent.Config
+	switch pod.Annotations[install.InjectAnnotation] {
+	case "disabled":
+		dlog.Debugf(ctx, `The %s pod is explicitly disabled using a %q annotation; skipping`, refPodName, install.InjectAnnotation)
+		return nil, nil
+	case "enabled":
+		config, err = a.findConfigMapValue(ctx, k8sapi.Pod(pod))
 		if err != nil {
-			dlog.Error(ctx, err)
 			return nil, err
 		}
-		if cfv == nil {
+		if config == nil || config.Create {
+			config, err = configFromAnnotations(ctx, pod, refPodName)
+			if err != nil || !hasSidecar && config == nil {
+				return nil, err
+			}
+		}
+	default:
+		config, err = a.findConfigMapValue(ctx, k8sapi.Pod(pod))
+		if err != nil {
+			return nil, err
+		}
+		if config == nil {
 			dlog.Debugf(ctx, `The %s pod has not enabled %s container injection through %q configmap or %q annotation; skipping`,
 				refPodName, install.AgentContainerName, AgentsConfigMap, install.InjectAnnotation)
 			return nil, nil
 		}
+		if config.Create {
+			config, err = configFromAnnotations(ctx, pod, refPodName)
+			if err != nil || !hasSidecar && config == nil {
+				return nil, err
+			}
+		}
 	}
 
+	if config != nil {
+		sb := strings.Builder{}
+		ye := yaml.NewEncoder(&sb)
+		ye.SetIndent(2)
+		if err := ye.Encode(config); err != nil {
+			return nil, err
+		}
+		dlog.Infof(ctx, sb.String())
+	}
 	svcName := pod.Annotations[install.ServiceNameAnnotation]
 	svc, err := findMatchingService(ctx, "", svcName, pod.Namespace, pod.Labels)
 	if err != nil {
@@ -159,6 +202,123 @@ func (a *agentInjector) inject(ctx context.Context, req *admission.AdmissionRequ
 	}
 	patches = addAgentVolume(pod, patches)
 	return patches, nil
+}
+
+func configFromAnnotations(ctx context.Context, pod *core.Pod, refPodName string) (*agent.Config, error) {
+	env := managerutil.GetEnv(ctx)
+	cns := pod.Spec.Containers
+	for i := range cns {
+		cn := &cns[i]
+		if cn.Name == install.AgentContainerName {
+			continue
+		}
+		ports := cn.Ports
+		for pi := range ports {
+			if ports[pi].ContainerPort == env.AgentPort {
+				return nil, fmt.Errorf(
+					"the %s pod container %s is exposing the same port (%d) as the %s sidecar",
+					refPodName, cn.Name, env.AgentPort, install.AgentContainerName)
+			}
+		}
+	}
+
+	wl, err := findOwnerWorkload(ctx, k8sapi.Pod(pod))
+	if err != nil {
+		return nil, err
+	}
+	if wl == nil {
+		dlog.Debugf(ctx, "Unable to find owner workload for pod %s; skipping", refPodName)
+		return nil, nil
+	}
+
+	svcName := pod.Annotations[install.ServiceNameAnnotation]
+	var svcs []k8sapi.Object
+	if svcName != "" {
+		svc, err := k8sapi.GetService(ctx, svcName, pod.Namespace)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				return nil, fmt.Errorf(
+					"unable to find service %s specified by annotation %s declared in pod %s", svcName, install.ServiceNameAnnotation, refPodName)
+			}
+			return nil, err
+		}
+		svcs = []k8sapi.Object{svc}
+	} else if len(pod.Labels) > 0 {
+		lbs := labels.Set(pod.Labels)
+		svcs, err = install.FindServicesSelecting(ctx, pod.Namespace, lbs)
+		if err != nil {
+			return nil, err
+		}
+		if len(svcs) == 0 {
+			return nil, fmt.Errorf("unable to find services that selects pod %s using labels %s", refPodName, lbs)
+		}
+	} else {
+		return nil, fmt.Errorf("unable to resolve a service using pod %s because it has no labels", refPodName)
+	}
+
+	portNameOrNumber := pod.Annotations[install.ServicePortAnnotation]
+	var ccs []*agent.Container
+	ccUnique := make(map[string]*agent.Container, len(cns))
+	nic := int32(0)
+	for _, svc := range svcs {
+		svcImpl, _ := k8sapi.ServiceImpl(svc)
+		for _, port := range install.FilterServicePorts(svcImpl, portNameOrNumber) {
+			cn, i := install.FindContainerMatchingPort(&port, cns)
+			if cn == nil || cn.Name == install.AgentContainerName {
+				continue
+			}
+			var appPort core.ContainerPort
+			if i < 0 {
+				// Can only happen if the service port is numeric, so it's safe to use TargetPort.IntVal here
+				appPort = core.ContainerPort{
+					Protocol:      port.Protocol,
+					ContainerPort: port.TargetPort.IntVal,
+				}
+			} else {
+				appPort = cn.Ports[i]
+			}
+			var appProto string
+			if port.AppProtocol != nil {
+				appProto = *port.AppProtocol
+			}
+
+			ic := &agent.Intercept{
+				ContainerPortName: appPort.Name,
+				ServiceName:       svcImpl.Name,
+				Protocol:          string(appPort.Protocol),
+				AppProtocol:       appProto,
+				AgentPort:         env.AgentPort + nic,
+				ContainerPort:     appPort.ContainerPort,
+			}
+			nic++
+
+			// The container might already have intercepts declared
+			cc := ccUnique[cn.Name]
+			if cc == nil {
+				cc = &agent.Container{
+					Name:       cn.Name,
+					Intercepts: nil,
+					EnvPrefix:  managerutil.CapsBase26(uint64(len(ccs))) + "_",
+					MountPoint: install.TelAppMountPoint + "/" + cn.Name,
+				}
+				ccUnique[cn.Name] = cc
+				ccs = append(ccs, cc)
+			}
+			cc.Intercepts = append(cc.Intercepts, ic)
+		}
+	}
+	if nic == 0 {
+		return nil, nil
+	}
+
+	return &agent.Config{
+		WorkloadName: wl.GetName(),
+		WorkloadKind: wl.GetKind(),
+		ManagerHost:  install.ManagerAppName + "." + env.ManagerNamespace,
+		ManagerPort:  install.ManagerPortHTTP,
+		APIPort:      env.APIPort,
+		Containers:   ccs,
+	}, nil
 }
 
 func addInitContainer(ctx context.Context, pod *core.Pod, svcPort *core.ServicePort, appPort *core.ContainerPort, patches []patchOperation) []patchOperation {
@@ -391,13 +551,16 @@ func hidePorts(pod *core.Pod, cn *core.Container, portName string, patches []pat
 	return patches
 }
 
-func (a *agentInjector) findConfigMapValue(ctx context.Context, obj k8sapi.Object) (*agentConfig, error) {
-	ag := agentConfig{}
+func (a *agentInjector) findConfigMapValue(ctx context.Context, obj k8sapi.Object) (*agent.Config, error) {
+	if a.agentConfigs == nil {
+		return nil, nil
+	}
+	ag := agent.Config{}
 	ok, err := a.agentConfigs.GetInto(obj.GetName(), obj.GetNamespace(), &ag)
 	if err != nil {
 		return nil, err
 	}
-	if ok {
+	if ok && (ag.WorkloadKind == "" || ag.WorkloadKind == obj.GetKind()) {
 		return &ag, nil
 	}
 	refs := obj.GetOwnerReferences()
@@ -411,4 +574,18 @@ func (a *agentInjector) findConfigMapValue(ctx context.Context, obj k8sapi.Objec
 		}
 	}
 	return nil, nil
+}
+
+func findOwnerWorkload(c context.Context, obj k8sapi.Object) (k8sapi.Object, error) {
+	refs := obj.GetOwnerReferences()
+	for i := range refs {
+		if or := &refs[i]; or.Controller != nil && *or.Controller {
+			wl, err := k8sapi.GetWorkload(c, or.Name, obj.GetNamespace(), or.Kind)
+			if err != nil {
+				return nil, err
+			}
+			return findOwnerWorkload(c, wl)
+		}
+	}
+	return obj, nil
 }

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/telepresenceio/telepresence/v2/pkg/install/agent"
+
 	"github.com/sethvargo/go-envconfig"
 
 	"github.com/datawire/dlib/dgroup"
@@ -22,16 +24,6 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/version"
 )
 
-type Intercept struct {
-	Service     string
-	AgentPort   int32
-	Container   string
-	MountPoint  string
-	AppProtocol string
-	Port        int32
-	Env         map[string]string
-}
-
 type Config struct {
 	Name        string `env:"_TEL_AGENT_NAME,required"`
 	Namespace   string `env:"_TEL_AGENT_NAMESPACE,default="`
@@ -39,18 +31,17 @@ type Config struct {
 	ManagerHost string `env:"_TEL_AGENT_MANAGER_HOST,default=traffic-manager"`
 	ManagerPort int32  `env:"_TEL_AGENT_MANAGER_PORT,default=8081"`
 	APIPort     int32  `env:"TELEPRESENCE_API_PORT,default="`
-	Intercepts  []*Intercept
 
 	// AppMounts
-	// Deprecated: Use Intercept.Mount
+	// Deprecated: Use Container.Mount
 	AppMounts string `env:"_TEL_AGENT_APP_MOUNTS,default=/tel_app_mounts"`
 
 	// AgentPort
-	// Deprecated: Use Intercept.AgentPort
+	// Deprecated: Use Container.AgentPort
 	AgentPort int32 `env:"_TEL_AGENT_PORT,default="`
 
 	// AppPort
-	// Deprecated: Use Intercept.Port
+	// Deprecated: Use Container.Port
 	AppPort int32 `env:"_TEL_AGENT_APP_PORT,default="`
 }
 
@@ -101,7 +92,7 @@ const tpMountsEnv = "TELEPRESENCE_MOUNTS"
 
 func (cfg *Config) HasMounts(ctx context.Context) bool {
 	for _, ic := range cfg.Intercepts {
-		tpMounts := ic.Env[tpMountsEnv]
+		tpMounts := ic.Environment[tpMountsEnv]
 		if tpMounts != "" {
 			dlog.Debugf(ctx, "agent mount paths: %s", tpMounts)
 			return true
@@ -158,17 +149,17 @@ func (cfg *Config) AddSecretsMounts(ctx context.Context) error {
 				return err
 			}
 			dlog.Infof(ctx, "new agent secrets mount path: %s", dirPath)
-			tpMounts := ic.Env[tpMountsEnv]
+			tpMounts := ic.Environment[tpMountsEnv]
 
 			if tpMounts == "" {
 				tpMounts = dirPath
 			} else {
 				tpMounts += ":" + dirPath
 			}
-			if ic.Env == nil {
-				ic.Env = make(map[string]string)
+			if ic.Environment == nil {
+				ic.Environment = make(map[string]string)
 			}
-			ic.Env[tpMountsEnv] = tpMounts
+			ic.Environment[tpMountsEnv] = tpMounts
 		}
 	}
 	return nil
@@ -241,14 +232,14 @@ func Main(ctx context.Context, args ...string) error {
 
 	// Create the currently one-and-only intercept. This code will go away
 	// once the config is read from a ConfigMap
-	config.Intercepts = []*Intercept{{
+	config.Intercepts = []*agent.Container{{
 		Service:     "service",
 		AgentPort:   config.AgentPort,
 		Container:   "container",
 		MountPoint:  config.AppMounts,
 		AppProtocol: "tcp",
 		Port:        config.AppPort,
-		Env:         AppEnvironment(),
+		Environment: AppEnvironment(),
 	}}
 	dlog.Infof(ctx, "%+v", config)
 
@@ -307,7 +298,7 @@ func Main(ctx context.Context, args ...string) error {
 			}
 
 			fwd := forwarder.NewForwarder(lisAddr, "", ic.Port)
-			state.AddIntercept(fwd, ic.MountPoint, ic.Env)
+			state.AddIntercept(fwd, ic.MountPoint, ic.Environment)
 			g.Go("forward-"+ic.Container, func(ctx context.Context) error {
 				return fwd.Serve(tunnel.WithPool(ctx, tunnel.NewPool()))
 			})

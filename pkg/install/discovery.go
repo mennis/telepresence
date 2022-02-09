@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/labels"
+
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -15,38 +17,76 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
 
-// svcPortByNameOrNumber iterates through a list of ports in a service and
-// only returns the ports that match the given nameOrNumber
-func svcPortByNameOrNumber(svc *core.Service, nameOrNumber string) []*core.ServicePort {
-	svcPorts := make([]*core.ServicePort, 0)
+// FilterServicePorts iterates through a list of ports in a service and
+// only returns the ports that match the given nameOrNumber. All ports will
+// be returned if nameOrNumber is equal to the empty string
+func FilterServicePorts(svc *core.Service, nameOrNumber string) []core.ServicePort {
 	ports := svc.Spec.Ports
-	validName := validation.IsValidPortName(nameOrNumber)
-	isName := len(validName) == 0
-	for i := range ports {
-		port := &ports[i]
-		matchFound := false
-		// If no nameOrNumber has been specified, we include it
-		if nameOrNumber == "" {
-			matchFound = true
-		}
-		// If the nameOrNumber is a valid name, we compare it to the
-		// name listed in the servicePort
-		if isName {
-			if nameOrNumber == port.Name {
-				matchFound = true
-			}
-		} else {
-			// Otherwise we compare it to the port number
-			givenPort, err := strconv.Atoi(nameOrNumber)
-			if err == nil && int32(givenPort) == port.Port {
-				matchFound = true
+	if nameOrNumber == "" {
+		return ports
+	}
+	svcPorts := make([]core.ServicePort, 0)
+	if len(validation.IsValidPortName(nameOrNumber)) == 0 {
+		for _, port := range ports {
+			if port.Name == nameOrNumber {
+				svcPorts = append(svcPorts, port)
 			}
 		}
-		if matchFound {
-			svcPorts = append(svcPorts, port)
+	} else {
+		number, err := strconv.Atoi(nameOrNumber)
+		if err != nil {
+			return nil
+		}
+		for _, port := range ports {
+			if port.Port == int32(number) {
+				svcPorts = append(svcPorts, port)
+			}
 		}
 	}
 	return svcPorts
+}
+
+// FindContainerMatchingPort finds the container that matches the given ServicePort. The match is
+// made using the Name or the ContainerPort field of each port in each container depending on if
+// the service port is symbolic or numeric. The first container with a matching port is returned
+// along with the index of the container port that matched.
+//
+// The first container with no ports at all is returned together with a port index of -1, in case
+// no port match could be made and the service port is numeric. This enables intercepts of containers
+// that indeed do listen a port but lack a matching port description in the manifest, which is what
+// you get if you do:
+//
+//     kubectl create deploy my-deploy --image my-image
+//     kubectl expose deploy my-deploy --port 80 --target-port 8080
+func FindContainerMatchingPort(port *core.ServicePort, cns []core.Container) (*core.Container, int) {
+	if port.TargetPort.Type == intstr.String {
+		portName := port.TargetPort.StrVal
+		for ci := range cns {
+			cn := &cns[ci]
+			for pi := range cn.Ports {
+				if cn.Ports[pi].Name == portName {
+					return cn, pi
+				}
+			}
+		}
+	} else {
+		portNum := port.TargetPort.IntVal
+		for ci := range cns {
+			cn := &cns[ci]
+			for pi := range cn.Ports {
+				if cn.Ports[pi].ContainerPort == portNum {
+					return cn, pi
+				}
+			}
+		}
+		for ci := range cns {
+			cn := &cns[ci]
+			if len(cn.Ports) == 0 {
+				return cn, -1
+			}
+		}
+	}
+	return nil, 0
 }
 
 func FindMatchingServices(c context.Context, portNameOrNumber, svcName, namespace string, labels map[string]string) ([]*core.Service, error) {
@@ -83,11 +123,29 @@ func FindMatchingServices(c context.Context, portNameOrNumber, svcName, namespac
 	var matching []*core.Service
 	for i := range ss {
 		svc := &ss[i]
-		if (svcName == "" || svc.Name == svcName) && labelsMatch(svc.Spec.Selector) && len(svcPortByNameOrNumber(svc, portNameOrNumber)) > 0 {
+		if (svcName == "" || svc.Name == svcName) && labelsMatch(svc.Spec.Selector) && len(FilterServicePorts(svc, portNameOrNumber)) > 0 {
 			matching = append(matching, svc)
 		}
 	}
 	return matching, nil
+}
+
+func FindServicesSelecting(c context.Context, namespace string, lbs labels.Labels) ([]k8sapi.Object, error) {
+	ss, err := k8sapi.Services(c, namespace, nil)
+	if err != nil {
+		return nil, err
+	}
+	var ms []k8sapi.Object
+	for _, s := range ss {
+		if sl, err := s.Selector(); err != nil {
+			return nil, err
+		} else if sl != nil {
+			if sl.Matches(lbs) {
+				ms = append(ms, s)
+			}
+		}
+	}
+	return ms, nil
 }
 
 func FindMatchingService(c context.Context, portNameOrNumber, svcName, namespace string, labels map[string]string) (*core.Service, error) {
@@ -125,7 +183,7 @@ func FindMatchingPort(cns []core.Container, portNameOrNumber string, svc *core.S
 	err error,
 ) {
 	// For now, we only support intercepting one port on a given service.
-	ports := svcPortByNameOrNumber(svc, portNameOrNumber)
+	ports := FilterServicePorts(svc, portNameOrNumber)
 	switch numPorts := len(ports); {
 	case numPorts == 0:
 		// this may happen when portNameOrNumber is specified but none of the
@@ -148,7 +206,7 @@ Please specify the Service port you want to intercept by passing the --port=loca
 			cn := &cns[ci]
 			for pi := range cn.Ports {
 				if cn.Ports[pi].Name == portName {
-					matchingServicePort = port
+					matchingServicePort = &port
 					matchingContainer = cn
 					containerPortIndex = pi
 					break
@@ -163,7 +221,7 @@ Please specify the Service port you want to intercept by passing the --port=loca
 			cn := &cns[ci]
 			for pi := range cn.Ports {
 				if cn.Ports[pi].ContainerPort == portNum {
-					matchingServicePort = port
+					matchingServicePort = &port
 					matchingContainer = cn
 					containerPortIndex = pi
 					break containerLoop
@@ -179,7 +237,7 @@ Please specify the Service port you want to intercept by passing the --port=loca
 			for ci := range cns {
 				cn := &cns[ci]
 				if len(cn.Ports) == 0 {
-					matchingServicePort = port
+					matchingServicePort = &port
 					matchingContainer = cn
 					containerPortIndex = -1
 					break

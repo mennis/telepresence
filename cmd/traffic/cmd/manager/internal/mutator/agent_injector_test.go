@@ -3,9 +3,12 @@ package mutator
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"reflect"
 	"testing"
+
+	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
+
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -38,35 +41,8 @@ func TestTrafficAgentInjector(t *testing.T) {
 	}
 	ctx := dlog.NewTestContext(t, false)
 	ctx = managerutil.WithEnv(ctx, env)
-
-	defaultSvc := &core.Service{
-		TypeMeta: meta.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
-		ObjectMeta: meta.ObjectMeta{
-			Name:        "some-name",
-			Namespace:   "some-ns",
-			Labels:      nil,
-			Annotations: nil,
-		},
-		Spec: core.ServiceSpec{
-			Ports: []core.ServicePort{{
-				Name:       "proxied",
-				Protocol:   "TCP",
-				Port:       80,
-				TargetPort: intstr.FromString("http"),
-			}},
-			Selector: map[string]string{
-				"service": "some-name",
-			},
-		},
-	}
-	defaultSvcFinder := func(c context.Context, portNameOrNumber, svcName, namespace string, labels map[string]string) (*core.Service, error) {
-		return defaultSvc, nil
-	}
-	numericPortSvcFinder := func(c context.Context, portNameOrNumber, svcName, namespace string, labels map[string]string) (*core.Service, error) {
-		return &core.Service{
+	clientset := fake.NewSimpleClientset(
+		&core.Service{
 			TypeMeta: meta.TypeMeta{
 				Kind:       "Service",
 				APIVersion: "v1",
@@ -80,32 +56,43 @@ func TestTrafficAgentInjector(t *testing.T) {
 			Spec: core.ServiceSpec{
 				Ports: []core.ServicePort{{
 					Protocol:   "TCP",
+					Name:       "proxied",
 					Port:       80,
-					TargetPort: intstr.FromInt(8888),
+					TargetPort: intstr.FromString("http"),
 				}},
 				Selector: map[string]string{
 					"service": "some-name",
 				},
 			},
-		}, nil
-	}
-	multiSvcFinder := func(c context.Context, portNameOrNumber, svcName, namespace string, labels map[string]string) (*core.Service, error) {
-		// simulate not being given a service name and finding multiple services
-		if svcName == "" {
-			return nil, fmt.Errorf("multiple services found")
-		}
-		if svcName == defaultSvc.Name {
-			return defaultSvc, nil
-		}
-		return nil, fmt.Errorf("no services found")
-	}
+		},
+		&core.Service{
+			TypeMeta: meta.TypeMeta{
+				Kind:       "Service",
+				APIVersion: "v1",
+			},
+			ObjectMeta: meta.ObjectMeta{
+				Name:        "numeric-port",
+				Namespace:   "some-ns",
+				Labels:      nil,
+				Annotations: nil,
+			},
+			Spec: core.ServiceSpec{
+				Ports: []core.ServicePort{{
+					Protocol:   "TCP",
+					Port:       80,
+					TargetPort: intstr.FromInt(8888),
+				}},
+				Selector: map[string]string{
+					"service": "numeric-port",
+				},
+			},
+		})
 
 	tests := []struct {
 		name          string
 		request       *admission.AdmissionRequest
 		expectedPatch string
 		expectedError string
-		serviceFinder svcFinder
 		envAdditions  *managerutil.Env
 	}{
 		{
@@ -117,7 +104,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 			}),
 			"",
 			"",
-			defaultSvcFinder,
 			nil,
 		},
 		{
@@ -125,7 +111,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 			toAdmissionRequest(podResource, "I'm a string value, not an object"),
 			"",
 			"could not deserialize pod object",
-			defaultSvcFinder,
 			nil,
 		},
 		{
@@ -135,7 +120,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 			}),
 			"",
 			"",
-			defaultSvcFinder,
 			nil,
 		},
 		{
@@ -147,15 +131,20 @@ func TestTrafficAgentInjector(t *testing.T) {
 			}),
 			"",
 			"",
-			defaultSvcFinder,
 			nil,
 		},
 		{
 			"Skip Precondition: Sidecar already injected",
 			toAdmissionRequest(podResource, core.Pod{
-				ObjectMeta: meta.ObjectMeta{Annotations: map[string]string{
-					install.InjectAnnotation: "enabled",
-				}, Namespace: "some-ns", Name: "some-name"},
+				ObjectMeta: meta.ObjectMeta{
+					Annotations: map[string]string{
+						install.InjectAnnotation: "enabled",
+					},
+					Labels: map[string]string{
+						"service": "numeric-port",
+					},
+					Namespace: "some-ns", Name: "some-name",
+				},
 				Spec: core.PodSpec{
 					Containers: []core.Container{
 						{
@@ -179,15 +168,17 @@ func TestTrafficAgentInjector(t *testing.T) {
 			}),
 			"",
 			"",
-			defaultSvcFinder,
 			nil,
 		},
 		{
 			"Error Precondition: No port specified",
 			toAdmissionRequest(podResource, core.Pod{
-				ObjectMeta: meta.ObjectMeta{Annotations: map[string]string{
-					install.InjectAnnotation: "enabled",
-				}, Namespace: "some-ns", Name: "some-name"},
+				ObjectMeta: meta.ObjectMeta{
+					Annotations: map[string]string{install.InjectAnnotation: "enabled"},
+					Namespace:   "some-ns",
+					Name:        "some-name",
+					Labels:      map[string]string{"service": "some-name"},
+				},
 				Spec: core.PodSpec{
 					Containers: []core.Container{
 						{Ports: []core.ContainerPort{}},
@@ -195,8 +186,7 @@ func TestTrafficAgentInjector(t *testing.T) {
 				},
 			}),
 			"",
-			"found no Service with a port that matches any container in this workload",
-			defaultSvcFinder,
+			"found no Service with a port that matches any container in pod some-name.some-ns",
 			nil,
 		},
 		{
@@ -221,7 +211,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 			}),
 			"",
 			"is exposing the same port (9900) as the traffic-agent sidecar",
-			defaultSvcFinder,
 			nil,
 		},
 		{
@@ -273,7 +262,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 				`}}` +
 				`]`,
 			"",
-			defaultSvcFinder,
 			nil,
 		},
 		{
@@ -327,7 +315,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 				`}}` +
 				`]`,
 			"",
-			defaultSvcFinder,
 			&managerutil.Env{
 				APIPort: 9981,
 			},
@@ -356,7 +343,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 			}),
 			"",
 			"multiple services found",
-			multiSvcFinder,
 			nil,
 		},
 		{
@@ -383,8 +369,7 @@ func TestTrafficAgentInjector(t *testing.T) {
 				},
 			}),
 			"",
-			"no services found",
-			multiSvcFinder,
+			"unable to find service khruangbin specified by annotation telepresence.getambassador.io/inject-service-name declared in pod some-name.some-ns",
 			nil,
 		},
 		{
@@ -393,7 +378,7 @@ func TestTrafficAgentInjector(t *testing.T) {
 				ObjectMeta: meta.ObjectMeta{
 					Annotations: map[string]string{
 						install.InjectAnnotation:      "enabled",
-						install.ServiceNameAnnotation: defaultSvc.Name,
+						install.ServiceNameAnnotation: "some-name",
 					},
 					Labels: map[string]string{
 						"service": "some-name",
@@ -437,7 +422,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 				`}}` +
 				`]`,
 			"",
-			multiSvcFinder,
 			nil,
 		},
 		{
@@ -448,7 +432,7 @@ func TestTrafficAgentInjector(t *testing.T) {
 						install.InjectAnnotation: "enabled",
 					},
 					Labels: map[string]string{
-						"service": "some-name",
+						"service": "numeric-port",
 					},
 					Namespace: "some-ns",
 					Name:      "some-name"},
@@ -500,7 +484,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 				`}}` +
 				`]`,
 			"",
-			numericPortSvcFinder,
 			nil,
 		},
 		{
@@ -511,7 +494,7 @@ func TestTrafficAgentInjector(t *testing.T) {
 						install.InjectAnnotation: "enabled",
 					},
 					Labels: map[string]string{
-						"service": "some-name",
+						"service": "numeric-port",
 					},
 					Namespace: "some-ns",
 					Name:      "some-name"},
@@ -566,7 +549,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 				`}}` +
 				`]`,
 			"",
-			numericPortSvcFinder,
 			nil,
 		},
 		{
@@ -577,7 +559,7 @@ func TestTrafficAgentInjector(t *testing.T) {
 						install.InjectAnnotation: "enabled",
 					},
 					Labels: map[string]string{
-						"service": "some-name",
+						"service": "numeric-port",
 					},
 					Namespace: "some-ns",
 					Name:      "some-name"},
@@ -623,7 +605,6 @@ func TestTrafficAgentInjector(t *testing.T) {
 				`}}` +
 				`]`,
 			"",
-			numericPortSvcFinder,
 			nil,
 		},
 		{
@@ -682,14 +663,13 @@ func TestTrafficAgentInjector(t *testing.T) {
 				`}}` +
 				`]`,
 			"",
-			defaultSvcFinder,
 			nil,
 		},
 	}
 
 	for _, test := range tests {
 		test := test // pin it
-		ctx := ctx
+		ctx := k8sapi.WithK8sInterface(ctx, clientset)
 		t.Run(test.name, func(t *testing.T) {
 			if test.envAdditions != nil {
 				env := managerutil.GetEnv(ctx)
@@ -708,9 +688,9 @@ func TestTrafficAgentInjector(t *testing.T) {
 			defer func() {
 				findMatchingService = fms
 			}()
-			findMatchingService = test.serviceFinder
 
-			actualPatch, actualErr := agentInjector(ctx, test.request)
+			a := agentInjector{}
+			actualPatch, actualErr := a.inject(ctx, test.request)
 			requireContains(t, actualErr, test.expectedError)
 			if actualPatch != nil || test.expectedPatch != "" {
 				patchBytes, err := json.Marshal(actualPatch)
@@ -727,10 +707,7 @@ func requireContains(t *testing.T, err error, expected string) {
 		require.NoError(t, err)
 		return
 	}
-	if err == nil {
-		require.Emptyf(t, expected, "expected error %q", expected)
-		return
-	}
+	require.Errorf(t, err, "expected error %q", expected)
 	require.Contains(t, err.Error(), expected)
 }
 
